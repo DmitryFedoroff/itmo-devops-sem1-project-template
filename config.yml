@@ -1,7 +1,8 @@
 server:
   port: 8080
-  read_timeout: 5s
-  write_timeout: 5s
+  read_timeout: 1m
+  write_timeout: 1m
+  max_file_size: 10MB
 
 database:
   host: localhost
