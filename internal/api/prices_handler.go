@@ -1,21 +1,24 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"time"
+
 	"project_sem/pkg/archiver"
 	"project_sem/pkg/serializer"
 	"project_sem/platform/storage"
 )
 
 type PriceStatistics struct {
-	TotalCount      int `json:"total_count"`
-	DuplicatesCount int `json:"duplicates_count"`
-	TotalItems      int `json:"total_items"`
-	TotalCategories int `json:"total_categories"`
-	TotalPrice      int `json:"total_price"`
+	TotalCount      int     `json:"total_count"`
+	DuplicatesCount int     `json:"duplicates_count"`
+	TotalItems      int     `json:"total_items"`
+	TotalCategories int     `json:"total_categories"`
+	TotalPrice      float64 `json:"total_price"`
 }
 
 func determineArchiver(r *http.Request) (interface {
@@ -30,8 +33,17 @@ func determineArchiver(r *http.Request) (interface {
 	return archiver.NewZipArchiver(), nil
 }
 
-func PostPrices(repo storage.Repository) http.HandlerFunc {
+func PostPrices(repo storage.Repository, maxFileSize int64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Minute)
+		defer cancel()
+		r = r.WithContext(ctx)
+
+		if r.ContentLength > maxFileSize && maxFileSize > 0 {
+			http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+
 		file, _, err := r.FormFile("file")
 		if err != nil {
 			log.Printf("failed to read file: %v\n", err)
@@ -40,6 +52,8 @@ func PostPrices(repo storage.Repository) http.HandlerFunc {
 		}
 		defer file.Close()
 
+		limitedReader := io.LimitReader(file, maxFileSize+1)
+
 		arch, err := determineArchiver(r)
 		if err != nil {
 			log.Printf("failed to determine archiver: %v\n", err)
@@ -47,7 +61,7 @@ func PostPrices(repo storage.Repository) http.HandlerFunc {
 			return
 		}
 
-		csvFile, err := arch.Extract(file)
+		csvFile, err := arch.Extract(limitedReader)
 		if err != nil {
 			log.Printf("failed to extract archive: %v\n", err)
 			http.Error(w, "failed to extract archive", http.StatusBadRequest)
@@ -55,33 +69,26 @@ func PostPrices(repo storage.Repository) http.HandlerFunc {
 		}
 		defer csvFile.Close()
 
-		products, totalCount, duplicatesCount, err := serializer.DeserializeProducts(csvFile)
+		products, totalCount, _, err := serializer.DeserializeProducts(csvFile)
 		if err != nil {
 			log.Printf("failed to deserialize products: %v\n", err)
 			http.Error(w, "failed to parse CSV", http.StatusBadRequest)
 			return
 		}
 
-		err = repo.InsertProducts(products)
+		duplicatesCount, totalItems, totalCategories, totalPrice, err := repo.InsertProductsAndStats(products)
 		if err != nil {
 			log.Printf("failed to insert products: %v\n", err)
 			http.Error(w, "failed to insert products", http.StatusInternalServerError)
 			return
 		}
 
-		totalItemsDB, totalCategoriesDB, totalPriceDB, err := repo.GetStats()
-		if err != nil {
-			log.Printf("failed to get stats: %v\n", err)
-			http.Error(w, "failed to get stats", http.StatusInternalServerError)
-			return
-		}
-
 		stats := PriceStatistics{
 			TotalCount:      totalCount,
 			DuplicatesCount: duplicatesCount,
-			TotalItems:      totalItemsDB,
-			TotalCategories: totalCategoriesDB,
-			TotalPrice:      int(totalPriceDB),
+			TotalItems:      totalItems,
+			TotalCategories: totalCategories,
+			TotalPrice:      totalPrice,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
