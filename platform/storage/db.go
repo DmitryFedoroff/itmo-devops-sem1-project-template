@@ -3,17 +3,18 @@ package storage
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/lib/pq"
 	"log"
-	"project_sem/platform/config"
 	"strings"
+
+	_ "github.com/lib/pq"
+	"project_sem/platform/config"
 )
 
 type Repository interface {
-	InsertProducts(products []Product) error
+	InsertProductsAndStats(products []Product) (int, int, int, float64, error)
 	GetAllProductsFiltered(start, end string, min, max string) ([]Product, error)
 	GetAllProducts() ([]Product, error)
-	GetStats() (int, int, float64, error)
+	Close() error
 }
 
 type repository struct {
@@ -21,10 +22,11 @@ type repository struct {
 }
 
 func NewRepository(cfg config.DatabaseSettings) (Repository, error) {
-	log.Println("connecting to the database...")
+	log.Println("Connecting to the database...")
 	const sslModeDisable = "disable"
 
-	connectionString := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+	connectionString := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		cfg.Host,
 		cfg.Port,
 		cfg.User,
@@ -37,66 +39,71 @@ func NewRepository(cfg config.DatabaseSettings) (Repository, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err = database.Ping(); err != nil {
 		return nil, err
 	}
-	log.Printf("successfully connected to database '%s'\n", cfg.Name)
+
+	log.Printf("Successfully connected to database '%s'\n", cfg.Name)
 	return &repository{db: database}, nil
 }
 
-func (r *repository) InsertProducts(products []Product) error {
+func (r *repository) Close() error {
+	return r.db.Close()
+}
+
+func (r *repository) InsertProductsAndStats(products []Product) (int, int, int, float64, error) {
 	tx, err := r.db.Begin()
 	if err != nil {
-		return err
+		return 0, 0, 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	_, err = tx.Exec(createTempTableQuery)
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
 
-	stmt, err := tx.Prepare(insertProductsQuery)
+	stmt, err := tx.Prepare(insertIntoTempTableQuery)
 	if err != nil {
-		tx.Rollback()
-		return err
+		return 0, 0, 0, 0, err
 	}
 	defer stmt.Close()
 
 	for _, product := range products {
-		_, err := stmt.Exec(product.ID, product.Name, product.Category, product.Price, product.CreateDate)
+		_, err = stmt.Exec(
+			product.ID,
+			product.Name,
+			product.Category,
+			product.Price,
+			product.CreateDate,
+		)
 		if err != nil {
-			tx.Rollback()
-			return err
+			return 0, 0, 0, 0, err
 		}
 	}
 
-	return tx.Commit()
-}
-
-func (r *repository) GetAllProducts() ([]Product, error) {
-	rows, err := r.db.Query(getAllProductsQuery)
+	var duplicatesCount, totalItems, totalCategories int
+	var totalPrice float64
+	err = tx.QueryRow(upsertAndStatsQuery).Scan(&duplicatesCount, &totalItems, &totalCategories, &totalPrice)
 	if err != nil {
-		return nil, err
+		return 0, 0, 0, 0, err
 	}
-	defer rows.Close()
 
-	products := make([]Product, 0, 10)
-
-	for rows.Next() {
-		var p Product
-		err := rows.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.CreateDate)
-		if err != nil {
-			return nil, err
-		}
-		products = append(products, p)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	return products, nil
+	return totalItems, duplicatesCount, totalCategories, totalPrice, nil
 }
 
-func (r *repository) GetAllProductsFiltered(start, end string, min, max string) ([]Product, error) {
-	var (
-		conditions []string
-		args       []interface{}
-	)
-	queryBuilder := strings.Builder{}
+func (r *repository) GetAllProductsFiltered(start, end, min, max string) ([]Product, error) {
+	var conditions []string
+	var args []interface{}
+
+	var queryBuilder strings.Builder
 	queryBuilder.WriteString(baseFilteredQuery)
 
 	argIndex := 1
@@ -146,12 +153,25 @@ func (r *repository) GetAllProductsFiltered(start, end string, min, max string) 
 	return products, nil
 }
 
-func (r *repository) GetStats() (int, int, float64, error) {
-	var totalItems, totalCategories int
-	var totalPrice float64
-	err := r.db.QueryRow(getStatsQuery).Scan(&totalItems, &totalCategories, &totalPrice)
+func (r *repository) GetAllProducts() ([]Product, error) {
+	rows, err := r.db.Query(getAllProductsQuery)
 	if err != nil {
-		return 0, 0, 0, err
+		return nil, err
 	}
-	return totalItems, totalCategories, totalPrice, nil
+	defer rows.Close()
+
+	products := make([]Product, 0, 10)
+
+	for rows.Next() {
+		var p Product
+		err := rows.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.CreateDate)
+		if err != nil {
+			return nil, err
+		}
+		products = append(products, p)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return products, nil
 }
