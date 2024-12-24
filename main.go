@@ -13,6 +13,10 @@ func main() {
 		log.Fatalf("failed to load configuration: %v", err)
 	}
 
-	app := server.New(settings)
+	app, err := server.New(settings)
+	if err != nil {
+		log.Fatalf("failed to initialize server: %v", err)
+	}
+
 	app.Run()
 }

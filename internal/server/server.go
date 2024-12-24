@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -28,10 +27,15 @@ type application struct {
 	wg       *sync.WaitGroup
 }
 
-func New(cfg config.Settings) Application {
+func New(cfg config.Settings) (Application, error) {
+	quit := make(chan os.Signal, 1)
+	wg := &sync.WaitGroup{}
+
 	repo, err := storage.NewRepository(cfg.Database)
 	if err != nil {
-		log.Fatalf("failed to create repository: %v", err)
+		log.Printf("failed to create repository: %v", err)
+		close(quit)
+		return nil, fmt.Errorf("repository initialization failed: %w", err)
 	}
 
 	mux := http.NewServeMux()
@@ -53,15 +57,12 @@ func New(cfg config.Settings) Application {
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
-	quit := make(chan os.Signal, 1)
-	wg := &sync.WaitGroup{}
-
 	return &application{
 		server:   serverInstance,
 		database: repo,
 		quit:     quit,
 		wg:       wg,
-	}
+	}, nil
 }
 
 func (a *application) Run() {
@@ -69,8 +70,9 @@ func (a *application) Run() {
 
 	go func() {
 		log.Printf("Starting server on %s", a.server.Addr)
-		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server failed: %v", err)
+		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("server failed: %v", err)
+			a.quit <- syscall.SIGTERM
 		}
 	}()
 
@@ -95,12 +97,14 @@ func (a *application) Run() {
 	go func() {
 		defer a.wg.Done()
 		if err := a.database.Close(); err != nil {
-			log.Printf("error while closing database connection: %v", err)
+			log.Printf("Error closing database: %v", err)
 		} else {
 			log.Println("Database connection closed successfully.")
 		}
 	}()
 
 	a.wg.Wait()
+
+	close(a.quit)
 	log.Println("All resources released. Server shutdown complete.")
 }
