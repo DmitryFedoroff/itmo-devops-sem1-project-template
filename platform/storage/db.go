@@ -65,38 +65,38 @@ func (r *repository) InsertProductsAndStats(products []Product) (int, int, int, 
 		}
 	}()
 
-	_, err = tx.Exec(createTempTableQuery)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	stmt, err := tx.Prepare(insertIntoTempTableQuery)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	defer stmt.Close()
+	inserted := 0
+	duplicates := 0
 
 	for _, product := range products {
-		_, err = stmt.Exec(
-			product.ID,
-			product.Name,
-			product.Category,
-			product.Price,
-			product.CreateDate,
-		)
+		var duplicateCount int
+		err = tx.QueryRow(checkDuplicateQuery, product.Name, product.Category, product.Price, product.CreateDate).Scan(&duplicateCount)
 		if err != nil {
 			return 0, 0, 0, 0, err
 		}
+
+		if duplicateCount > 0 {
+			duplicates++
+			continue
+		}
+
+		_, err = tx.Exec(insertProductQuery, product.ID, product.Name, product.Category, product.Price, product.CreateDate)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+
+		inserted++
 	}
 
-	var duplicatesCount, totalItems, totalCategories int
+	var totalItems, totalCategories int
 	var totalPrice float64
-	err = tx.QueryRow(upsertAndStatsQuery).Scan(&duplicatesCount, &totalItems, &totalCategories, &totalPrice)
+
+	err = tx.QueryRow(calculateStatsQuery).Scan(&totalItems, &totalCategories, &totalPrice)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 
-	return totalItems, duplicatesCount, totalCategories, totalPrice, nil
+	return totalItems, duplicates, totalCategories, totalPrice, nil
 }
 
 func (r *repository) GetAllProductsFiltered(start, end, min, max string) ([]Product, error) {
